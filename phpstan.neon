@@ -1,0 +1,15 @@
+includes:
+    - ../librenms/vendor/larastan/larastan/extension.neon
+    - ../librenms/vendor/phpstan/phpstan-mockery/extension.neon
+    - ../librenms/vendor/phpstan/phpstan-phpunit/extension.neon
+
+parameters:
+    level: 6
+    paths:
+        - src
+        - tests
+    bootstrapFiles:
+        - tests/phpstan-bootstrap.php
+    parseModelCastsMethod: true
+    checkModelProperties: true
+    treatPhpDocTypesAsCertain: false
