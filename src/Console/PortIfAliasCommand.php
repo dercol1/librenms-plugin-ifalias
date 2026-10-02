@@ -2,14 +2,12 @@
 
 namespace Dercol1\LibrenmsIfAlias\Console;
 
-use App\Models\Device;
-use App\Models\Port;
+use Dercol1\LibrenmsIfAlias\Report\IfAliasReport;
+use Dercol1\LibrenmsIfAlias\Report\ReportOptions;
+use Dercol1\LibrenmsIfAlias\Settings\PluginSettings;
 use Illuminate\Console\Command;
-use Illuminate\Database\Eloquent\Builder;
-use SnmpQuery;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputOption;
-use Throwable;
 
 /**
  * Report where the ifAlias stored for each port comes from.
@@ -20,389 +18,81 @@ use Throwable;
  * which one is in use, so auditing which ifAlias values are user maintained
  * otherwise means writing SQL against devices_attribs by hand.
  *
+ * Every option defaults to the plugin settings, so what is set in the web ui
+ * (Plugins -> ifalias -> Settings) is what a plain "lnms port:ifAlias all"
+ * does, and every option can still be overridden per run with its --no- twin:
+ * --diff|--no-diff, --snmp|--no-snmp and so on.
+ *
  * Read only: nothing is polled and nothing is written.
  */
 class PortIfAliasCommand extends Command
 {
     protected $name = 'port:ifAlias';
 
-    /** The device attribute the web ui writes to mark a user override. */
-    private const OVERRIDE_PREFIX = 'ifName:';
-
-    /** The value written by the web ui, meaning "use ports.ifAlias". */
-    private const OVERRIDE_LEGACY = '1';
-
-    private const RESET = "\033[0m";
-
-    private const BOLD = "\033[1m";
-
-    private const DIM = "\033[2m";
-
-    private const RED = "\033[0;31m";
-
-    private const GREEN = "\033[0;32m";
-
-    private const YELLOW = "\033[0;33m";
-
-    private const BLUE = "\033[0;34m";
-
-    private ConsolePager $pager;
-
-    private bool $colors = false;
-
-    private int $same = 0;
-
-    private int $different = 0;
-
-    private int $overrides = 0;
-
-    private int $fills = 0;
-
     protected function configure(): void
     {
         // -h, -q, -v, -V, -n and -e belong to the Symfony console itself
+        $settings = PluginSettings::current();
+
         $this->setDescription(__('ifalias::command.description'))
-            ->addArgument('device spec', InputArgument::OPTIONAL, __('ifalias::command.arguments.device spec'), 'all')
-            ->addOption('diff', 'd', InputOption::VALUE_NONE, __('ifalias::command.options.diff'))
-            ->addOption('override-only', null, InputOption::VALUE_NONE, __('ifalias::command.options.override-only'))
-            ->addOption('inactive', 'o', InputOption::VALUE_NONE, __('ifalias::command.options.inactive'))
-            ->addOption('no-snmp', null, InputOption::VALUE_NONE, __('ifalias::command.options.no-snmp'))
-            ->addOption('pager', null, InputOption::VALUE_REQUIRED, __('ifalias::command.options.pager'))
-            ->addOption('lines', null, InputOption::VALUE_REQUIRED, __('ifalias::command.options.lines'), 30);
+            ->addArgument('device spec', InputArgument::OPTIONAL, __('ifalias::command.arguments.device spec'), $settings->deviceSpec())
+            ->addOption('diff', 'd', InputOption::VALUE_NEGATABLE, __('ifalias::command.options.diff'), $settings->diffOnly())
+            ->addOption('override-only', null, InputOption::VALUE_NEGATABLE, __('ifalias::command.options.override-only'), $settings->overrideOnly())
+            ->addOption('inactive', 'o', InputOption::VALUE_NEGATABLE, __('ifalias::command.options.inactive'), $settings->includeInactive())
+            ->addOption('snmp', null, InputOption::VALUE_NEGATABLE, __('ifalias::command.options.snmp'), $settings->snmp())
+            ->addOption('max-devices', null, InputOption::VALUE_REQUIRED, __('ifalias::command.options.max-devices'), $settings->maxDevices())
+            ->addOption('pager', null, InputOption::VALUE_REQUIRED, __('ifalias::command.options.pager'), $settings->pager())
+            ->addOption('lines', null, InputOption::VALUE_REQUIRED, __('ifalias::command.options.lines'), $settings->lines());
     }
 
     public function handle(): int
     {
+        $options = $this->reportOptions();
+
         // Colours are only emitted when the output supports them, so a report
         // piped to a file or to grep stays free of escape sequences. They are
         // emitted as raw codes because the pager receives the text directly,
         // bypassing the Symfony formatter, and less -R passes them through.
-        $this->colors = $this->output->isDecorated();
-
-        $this->pager = new ConsolePager(
-            $this->option('pager') !== null ? (string) $this->option('pager') : null,
-            max(1, (int) $this->option('lines')),
+        $pager = new ConsolePager(
+            $options->pager,
+            $options->lines,
             fn (string $text) => $this->output->write($text)
         );
 
-        $mode = $this->pager->open();
+        $mode = $pager->open();
 
-        $devices = Device::whereDeviceSpec((string) $this->argument('device spec'))
-            ->orderBy('hostname')
-            ->get();
+        $result = (new IfAliasReport($options))->render($pager, $this->pagerNote($mode));
 
-        if ($devices->isEmpty()) {
-            $this->pager->write(__('ifalias::command.errors.no_device') . PHP_EOL);
-            $this->pager->close();
+        $pager->close();
 
-            return self::FAILURE;
-        }
-
-        $this->pager->write($this->header($mode) . PHP_EOL);
-
-        foreach ($devices as $device) {
-            $this->processDevice($device);
-
-            if ($this->pager->quitRequested()) {
-                break;
-            }
-        }
-
-        // a summary over a partial run would be misleading
-        if (! $this->pager->quitRequested()) {
-            $this->pager->write(PHP_EOL . $this->summary() . PHP_EOL);
-        }
-
-        $this->pager->close();
-
-        return self::SUCCESS;
+        return $result->matched ? self::SUCCESS : self::FAILURE;
     }
 
-    private function header(string $pagerMode): string
+    /** Command::options() is taken by the framework, hence the name. */
+    private function reportOptions(): ReportOptions
     {
-        $dim = $this->paint(self::DIM);
-        $reset = $this->paint(self::RESET);
+        $pager = $this->option('pager');
 
-        return implode(PHP_EOL, [
-            $dim . __('ifalias::command.sources') . ' ' . __('ifalias::command.source_legend') . $reset,
-            $dim . __('ifalias::command.pager') . ' ' . $this->pagerDescription($pagerMode) . $reset,
-        ]);
+        return new ReportOptions(
+            deviceSpec: (string) $this->argument('device spec'),
+            snmp: (bool) $this->option('snmp'),
+            diffOnly: (bool) $this->option('diff'),
+            overrideOnly: (bool) $this->option('override-only'),
+            includeInactive: (bool) $this->option('inactive'),
+            colors: $this->output->isDecorated(),
+            maxDevices: max(0, (int) $this->option('max-devices')),
+            lines: max(1, (int) $this->option('lines')),
+            pager: $pager === null ? null : (string) $pager, // null auto detects, "cat" and "" mean no pager
+        );
     }
 
-    private function pagerDescription(string $mode): string
+    /** The line under the header telling the reader how the output is paged. */
+    private function pagerNote(string $mode): string
     {
         return match ($mode) {
-            ConsolePager::MODE_LESS => (string) ($this->option('pager') ?: __('ifalias::command.default_pager')),
-            ConsolePager::MODE_ENTER => __('ifalias::command.pager_fallback', ['lines' => $this->option('lines')]),
-            default => __('ifalias::command.pager_off'),
+            ConsolePager::MODE_LESS => __('ifalias::command.pager') . ' ' . (string) ($this->option('pager') ?: __('ifalias::command.default_pager')),
+            ConsolePager::MODE_ENTER => __('ifalias::command.pager') . ' ' . __('ifalias::command.pager_fallback', ['lines' => $this->option('lines')]),
+            default => __('ifalias::command.pager') . ' ' . __('ifalias::command.pager_off'),
         };
-    }
-
-    private function processDevice(Device $device): void
-    {
-        $ports = $device->ports()
-            ->when(! $this->option('inactive'), fn (Builder $query) => $query->where('deleted', 0)->where('disabled', 0))
-            ->orderBy('ifIndex')
-            ->get();
-
-        $this->pager->page($this->deviceHeader($device, $ports->count()) . PHP_EOL);
-
-        if ($ports->isEmpty()) {
-            $this->pager->page(__('ifalias::command.errors.no_ports') . PHP_EOL . PHP_EOL);
-
-            return;
-        }
-
-        $has_snmp = ! $this->option('no-snmp');
-        $device_values = $has_snmp ? $this->fetchDeviceValues($device) : [];
-
-        $this->pager->page($this->tableHeader() . PHP_EOL);
-
-        foreach ($ports as $port) {
-            $this->processPort($device, $port, $device_values, $has_snmp);
-
-            if ($this->pager->quitRequested()) {
-                return;
-            }
-        }
-
-        $this->pager->page(PHP_EOL);
-    }
-
-    private function deviceHeader(Device $device, int $portCount): string
-    {
-        // Device::displayName() is deprecated, read the field directly
-        $name = (string) ($device->display ?: $device->hostname);
-
-        return $this->paint(self::BOLD) . __('ifalias::command.device', [
-            'device' => $name,
-            'os' => $device->os,
-            'ports' => $portCount,
-        ]) . $this->paint(self::RESET);
-    }
-
-    /**
-     * Live values from the device, keyed by ifIndex then by bare OID name.
-     *
-     * ifAlias and ifDescr are walked separately so that a device not
-     * implementing one of them still reports the other. hideMib() is required:
-     * without it the keys come back as IF-MIB::ifAlias.1 and the lookups below
-     * would never match.
-     *
-     * @return array<int, array<string, string>>
-     */
-    private function fetchDeviceValues(Device $device): array
-    {
-        $values = [];
-
-        foreach (['ifAlias', 'ifDescr'] as $oid) {
-            try {
-                $response = SnmpQuery::make()->hideMib()->device($device)->walk([$oid]);
-            } catch (Throwable) {
-                continue; // not supported, the column is reported as unavailable
-            }
-
-            if (! $response->isValid()) {
-                continue;
-            }
-
-            foreach ($response->valuesByIndex() as $index => $row) {
-                $values[$index] = array_merge($values[$index] ?? [], $row);
-            }
-        }
-
-        return $values;
-    }
-
-    /**
-     * @param  array<int, array<string, string>>  $device_values
-     */
-    private function processPort(Device $device, Port $port, array $device_values, bool $has_snmp): void
-    {
-        $db = (string) ($port->ifAlias ?? '');
-        $device_alias = (string) ($device_values[$port->ifIndex]['ifAlias'] ?? '');
-        $device_descr = (string) ($device_values[$port->ifIndex]['ifDescr'] ?? '');
-
-        $override = $device->getAttrib(self::OVERRIDE_PREFIX . $port->ifName);
-        $is_override = $override !== null;
-        $is_different = $has_snmp && $db !== $device_alias;
-
-        $source = $this->determineSource($is_override, $has_snmp, $device_alias, $device_descr, $db, (string) $port->ifName);
-
-        // count every port, then filter, so the summary always describes the
-        // whole install and not only what was printed
-        $is_fill = str_starts_with($source, 'fill');
-        if ($is_override) {
-            $this->overrides++;
-        }
-        if ($is_fill) {
-            $this->fills++;
-        }
-        if ($is_different) {
-            $this->different++;
-        } elseif ($has_snmp) {
-            $this->same++;
-        }
-
-        if (! $this->shouldPrint($is_override, $is_different)) {
-            return;
-        }
-
-        $this->pager->page($this->portRow(
-            $port,
-            $db,
-            $device_alias,
-            $has_snmp,
-            $source,
-            $is_override,
-            $override === null ? null : (string) $override,
-            $is_different,
-            $is_fill
-        ));
-    }
-
-    /**
-     * Where the stored ifAlias comes from.
-     *
-     * An override always wins, so it is checked first. Otherwise the device has
-     * the last word, unless it reports no ifAlias at all: in that case
-     * port_fill_missing_and_trim() in includes/functions.php has copied ifDescr,
-     * or ifName when there is no ifDescr either, into the ifAlias field. That is
-     * LibreNMS filling a gap, not something the user asked for, and the two are
-     * reported separately so they are never confused.
-     */
-    private function determineSource(
-        bool $is_override,
-        bool $has_snmp,
-        string $device_alias,
-        string $device_descr,
-        string $db,
-        string $ifName
-    ): string {
-        if ($is_override) {
-            return 'override';
-        }
-
-        if (! $has_snmp) {
-            return 'db only';
-        }
-
-        if ($device_alias !== '') {
-            return 'device';
-        }
-
-        $expected = $device_descr !== '' ? $device_descr : $ifName;
-
-        if ($expected !== '' && $db === $expected) {
-            return 'fill ' . ($device_descr !== '' ? 'ifDescr' : 'ifName');
-        }
-
-        return 'fill ?';
-    }
-
-    private function shouldPrint(bool $is_override, bool $is_different): bool
-    {
-        if ($this->option('override-only') && ! $is_override) {
-            return false;
-        }
-
-        return ! $this->option('diff') || $is_different;
-    }
-
-    private function portRow(
-        Port $port,
-        string $db,
-        string $device_alias,
-        bool $has_snmp,
-        string $source,
-        bool $is_override,
-        ?string $override,
-        bool $is_different,
-        bool $is_fill
-    ): string {
-        $status = $is_different ? 'DIFFERENT' : ($has_snmp ? 'same' : 'db-only');
-        $row = $this->paint($this->rowColor($is_override, $is_fill, $is_different, $has_snmp)) . sprintf(
-            '%-7s %-20s %-30s %-30s %-13s %s',
-            $port->ifIndex,
-            $this->shorten((string) $port->ifName, 18),
-            $this->shorten($db, 28),
-            $has_snmp ? $this->shorten($device_alias, 28) : '(not polled)',
-            $source,
-            $status
-        ) . $this->paint(self::RESET) . PHP_EOL;
-
-        $note = $this->paint(self::DIM);
-
-        if ($is_override && $override !== self::OVERRIDE_LEGACY) {
-            $row .= '           ' . $note . __('ifalias::command.notes.override_value', ['value' => $override]) . $this->paint(self::RESET) . PHP_EOL;
-        }
-
-        if ($is_override && $override === self::OVERRIDE_LEGACY) {
-            $row .= '           ' . $note . __('ifalias::command.notes.override_legacy') . $this->paint(self::RESET) . PHP_EOL;
-        }
-
-        if ($source === 'fill ?') {
-            $row .= '           ' . $note . __('ifalias::command.notes.fill_unknown') . $this->paint(self::RESET) . PHP_EOL;
-        } elseif ($is_fill) {
-            $row .= '           ' . $note . __('ifalias::command.notes.fill', [
-                'field' => $source === 'fill ifDescr' ? 'ifDescr' : 'ifName',
-            ]) . $this->paint(self::RESET) . PHP_EOL;
-        }
-
-        if ($is_different && ! $is_override && $device_alias !== '') {
-            $row .= '           ' . $note . __('ifalias::command.notes.will_overwrite') . $this->paint(self::RESET) . PHP_EOL;
-        }
-
-        return $row;
-    }
-
-    /**
-     * One colour per case, so a long report can be skimmed: yellow is a value
-     * a user controls, blue is the automatic fallback, red differs from the
-     * device without an override, green matches it.
-     */
-    private function rowColor(bool $is_override, bool $is_fill, bool $is_different, bool $has_snmp): string
-    {
-        return match (true) {
-            $is_override => self::YELLOW,
-            $is_fill => self::BLUE,
-            $is_different => self::RED,
-            $has_snmp => self::GREEN,
-            default => '',
-        };
-    }
-
-    /** Escape sequence, or nothing when the output is not decorated. */
-    private function paint(string $code): string
-    {
-        return $this->colors ? $code : '';
-    }
-
-    private function tableHeader(): string
-    {
-        return $this->paint(self::BOLD) . sprintf(
-            '%-7s %-20s %-30s %-30s %-13s %s',
-            'ifIndex',
-            'ifName',
-            'db (ports.ifAlias)',
-            'snmp (IF-MIB::ifAlias)',
-            'source',
-            'status'
-        ) . $this->paint(self::RESET) . PHP_EOL;
-    }
-
-    private function shorten(string $value, int $width): string
-    {
-        return mb_strimwidth($value, 0, $width, '..');
-    }
-
-    private function summary(): string
-    {
-        return __('ifalias::command.summary', [
-            'different' => $this->different,
-            'overrides' => $this->overrides,
-            'fills' => $this->fills,
-            'same' => $this->same,
-        ]);
     }
 }

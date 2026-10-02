@@ -8,10 +8,11 @@ return [
     ],
 
     'options' => [
-        'diff' => 'Only show ports where the stored ifAlias differs from the device value',
-        'override-only' => 'Only show ports that have a user override',
-        'inactive' => 'Include deleted and disabled ports',
-        'no-snmp' => 'Do not contact the devices, report the database values only',
+        'diff' => 'Only show ports where the stored ifAlias differs from the device value (--no-diff to show all)',
+        'override-only' => 'Only show ports that have a user override (--no-override-only to show all)',
+        'inactive' => 'Include deleted and disabled ports (--no-inactive to hide them)',
+        'snmp' => 'Contact the devices, --no-snmp reports the database values only',
+        'max-devices' => 'Examine at most this many devices, 0 for no limit',
         'pager' => 'Pager command to use, "cat" to disable paging',
         'lines' => 'Lines to print before pausing, when the pager is unavailable',
     ],
@@ -25,6 +26,8 @@ return [
     'default_pager' => 'less -R -S -X -F',
     'pager_fallback' => 'no usable pager, pausing every :lines lines instead',
     'pager_off' => 'off, the output is not a terminal',
+
+    'truncated' => 'only the first :devices devices are reported, raise --max-devices or set it to 0 in the plugin settings',
 
     'notes' => [
         'override_value' => 'override attribute value: :value',

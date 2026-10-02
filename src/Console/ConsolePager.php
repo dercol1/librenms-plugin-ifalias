@@ -25,6 +25,8 @@
 
 namespace Dercol1\LibrenmsIfAlias\Console;
 
+use Dercol1\LibrenmsIfAlias\Report\ReportSink;
+
 /**
  * Three modes, chosen by open():
  *   less   the text is streamed into an external pager (less by default):
@@ -32,8 +34,11 @@ namespace Dercol1\LibrenmsIfAlias\Console;
  *          cleared on exit, and quits at once when the text fits one screen
  *   enter  fallback when no pager can be spawned: pause every N lines
  *   plain  no paging, useful when the output is redirected
+ *
+ * It is the sink the report writes to on a terminal: page() is where a page
+ * break may land, and quitRequested() reports that the reader walked away.
  */
-class ConsolePager
+class ConsolePager implements ReportSink
 {
     public const MODE_LESS = 'less';
 

@@ -1,7 +1,8 @@
 # librenms-plugin-ifalias
 
 LibreNMS plugin that adds `lnms port:ifAlias`, a read only report of where the
-`ifAlias` stored for each port actually comes from.
+`ifAlias` stored for each port actually comes from, plus a settings page that
+runs it and explains it without a terminal.
 
 ## Why
 
@@ -20,6 +21,13 @@ nobody asked for it. Until now the only hint was a pencil icon in the web ui,
 and there was no command line way to tell them apart, so auditing which
 `ifAlias` values are user maintained meant writing SQL against `devices_attribs`
 by hand.
+
+## What you get
+
+- `lnms port:ifAlias`, the report on a terminal, with paging and colours
+- a settings page (**Settings -> Plugins -> ifalias -> Settings**) with the
+  settings that are worth setting, the full manual, and the same report run from
+  the browser into a text window on the page
 
 ## Install
 
@@ -166,7 +174,64 @@ entries are listed with:
 sudo -u librenms php /opt/librenms/scripts/composer_wrapper.php config --global repositories
 ```
 
-## Usage
+## Usage from the web ui
+
+Everything is in the plugin settings page: **Settings -> Plugins -> ifalias ->
+Settings**. The button core renders for the plugin leads there, and the page
+holds three things:
+
+- the **settings form**, the defaults of the report
+- the **manual**, the full reference, right on the page
+- the **run form**, and the report in a scrollable text window below it
+
+No terminal involved:
+
+```text
+Plugins -> Settings -> ifalias -> Settings
+  [Settings]   device spec, ask the devices, filters, colours, limits, pager
+  [Run the report]   pick what to look at, press Run, read it below
+  [Manual]     what the report means, every setting, the command line equivalent
+```
+
+The run is a plain GET, so the address bar holds the whole run: it can be
+reloaded, bookmarked and sent to a colleague. The report arrives in a text
+window you can scroll, filter, copy out of, and read with or without colours.
+
+Asking the devices walks `IF-MIB::ifAlias` and `IF-MIB::ifDescr` on every
+selected device. On a large install that takes a while, so the settings carry a
+device limit, and you can turn the device walk off for a database only report.
+
+The page needs the `plugin.admin` permission, the same one that guards the
+plugin list.
+
+## Settings
+
+The settings are the defaults of both the run form and `lnms port:ifAlias`, and
+each one can be flipped per run with its `--no-` twin.
+
+| Setting | Default | What it does |
+| ------- | ------- | ------------ |
+| `device_spec` | `all` | Which devices to examine: id, hostname, group, `core*`, `odd`, `even`, `all` |
+| `snmp` | on | Walk the devices. Off reports the database values only |
+| `diff_only` | off | Only the ports whose stored ifAlias differs from the device |
+| `override_only` | off | Only the ports a user overrode |
+| `include_inactive` | off | Include deleted and disabled ports |
+| `colors` | on | Colour the report |
+| `max_devices` | `0` | Devices at most, `0` for no limit. Stops a run from walking away |
+| `lines` | `30` | Terminal only: lines per page when no pager is available |
+| `pager` | auto | Terminal only: pager command, `cat` for none |
+
+They are stored in the database, so a LibreNMS update does not touch them.
+`config/ifalias.php` carries the defaults and can be published with:
+
+```bash
+php artisan vendor:publish --provider="Dercol1\LibrenmsIfAlias\IfAliasPluginProvider" --tag=config
+```
+
+A value saved from the browser wins over the file; anything left untouched falls
+back to it.
+
+## Usage from the command line
 
 ```bash
 lnms port:ifAlias all                      # every active device
@@ -176,6 +241,8 @@ lnms port:ifAlias all --override-only      # only the ports a user overrode
 lnms port:ifAlias all --diff               # only the ones differing from the device
 lnms port:ifAlias router01 --no-snmp       # database only, no device contact
 lnms port:ifAlias router01 --inactive      # include deleted and disabled ports
+lnms port:ifAlias all --max-devices=50     # stop after 50 devices
+lnms port:ifAlias all --no-diff --no-inactive   # override the saved settings
 ```
 
 The command never polls and never writes anything.
@@ -214,7 +281,7 @@ folded, and the screen is not cleared on exit. Search with `/`, move with
 ports, never in the middle of a row.
 
 Redirection (a pipe, a file, `grep`) turns paging off by itself so the output
-stays capturable. Page size comes from `--lines`, then `IFALIAS_LINES`.
+stays capturable. Page size comes from `--lines`, then the `lines` setting.
 
 ```bash
 lnms port:ifAlias all > ifalias.txt          # no paging, whole report captured
@@ -241,12 +308,32 @@ Colours are emitted only when the output supports them, following the usual
 or a pipe contains no escape sequences. When the report is paged the codes
 reach `less` untouched and `-R` passes them through.
 
+In the web ui the same colours arrive as markup: the escape sequences are turned
+into `<span class="ifalias-green">` and so on, and the stored values are escaped
+on the way, since an `ifAlias` comes from a device.
+
 If you see no colour at all, check in this order:
 
 ```bash
 echo $TERM                    # empty or "dumb" means no colour support
 lnms port:ifAlias all --ansi  # force it, useful to isolate the cause
 ```
+
+## Routes and the route cache
+
+The run form needs one url, `plugin/ifalias/run`, which the plugin registers
+itself behind the same auth and `plugin.admin` gate as the settings page. It is
+skipped when the routes are cached, because the cached collection already holds
+it and adding to a compiled collection throws.
+
+That means the cache has to be built **after** the plugin was installed. If the
+run button gives a 404, clear it:
+
+```bash
+php artisan optimize:clear    # or php artisan route:cache
+```
+
+`daily.sh` starts with the same command, so an update fixes it on its own.
 
 ## Uninstall
 
@@ -369,6 +456,33 @@ either command if you need the toolchain back.
 The tests need no MySQL and no snmpsim: they use LibreNMS `InMemoryDbTestCase`
 and a faked `SnmpQueryInterface`, so the device, override and fallback cases
 are covered deterministically.
+
+The settings page tests go through the real http kernel and hit the core routes,
+so they cover what a browser actually gets: the settings form, the manual, the
+run form, the escaping of stored values and the permissions. Two details are
+worth knowing if a test ever surprises you:
+
+- a command reads the settings when it is configured, once per process, so a test
+  that changes the settings drops the console kernel before calling artisan
+- the plugin manager caches the plugins table while the application boots, before
+  a test switched to its own database, so the tests clear that cache too
+
+## Layout
+
+```
+src/IfAliasPluginProvider.php   views, translations, config defaults, routes, command
+src/Console/                    the command and the pager
+src/Report/                     the report itself, written to a sink
+src/Settings/PluginSettings.php stored settings over config defaults, coerced
+src/Web/                        the run route, the settings page data, ansi to html
+src/Hooks/Settings.php          the settings hook core renders the page through
+resources/views/settings.blade.php   the page: settings, run form, text window
+resources/views/manual.blade.php      the manual shown on the same page
+```
+
+The report does not know who is reading it: it writes to a `ReportSink`, which
+is the pager on a terminal and a buffer in the browser. That is why the web ui and
+the command always agree.
 
 ## License
 
