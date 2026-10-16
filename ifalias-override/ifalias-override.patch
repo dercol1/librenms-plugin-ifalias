@@ -1,0 +1,81 @@
+--- includes/custom/port-descr-parser-priority.inc.orig	1970-01-01 00:00:00.000000000 +0000
++++ includes/custom/port-descr-parser-priority.inc.php	1970-01-01 00:00:00.000000000 +0000
+@@ -0,0 +1,78 @@
++<?php
++
++/**
++ * Custom interface description parser that prioritizes database override (ifAlias_override)
++ * over SNMP ifAlias value.
++ *
++ * This parser:
++ * 1. Uses ifAlias_override (user-defined value from database) if set
++ * 2. Falls back to ifAlias (raw SNMP value) if no override
++ * 3. Parses the chosen value using the standard format:
++ *    Type: Description [Speed] {Circuit} (Notes)
++ *
++ * Enable with:
++ *   lnms config:set port_descr_parser includes/custom/port-descr-parser-priority.inc.php
++ */
++
++return function (
++    string $ifAlias = '',
++    ?string $ifAlias_override = null,
++    string $ifIndex = '',
++    string $ifName = '',
++    int $port_id = 0
++): array {
++    // Priorità 1: Override da database (valore impostato dall'utente via UI/API)
++    // Priorità 2: Valore raw da SNMP
++    $source_alias = $ifAlias_override !== null && $ifAlias_override !== ''
++        ? $ifAlias_override
++        : $ifAlias;
++
++    if ($source_alias === '') {
++        return [];
++    }
++
++    // Parsing formato standard: Type: Description [Speed] {Circuit} (Notes)
++    // Esempio: "Cust: Acme Corp [1Gbps] {CIRCUIT-123} (Primary link)"
++
++    $result = [
++        'type' => '',
++        'descr' => '',
++        'circuit' => '',
++        'speed' => '',
++        'notes' => '',
++    ];
++
++    // Estrai type e description (prima del primo ':')
++    if (str_contains($source_alias, ':')) {
++        $parts = explode(':', $source_alias, 2);
++        $result['type'] = strtolower(trim($parts[0]));
++        $remaining = trim($parts[1]);
++    } else {
++        // Se non c'è ':', trattiamo tutto come description
++        $remaining = $source_alias;
++    }
++
++    // Estrai speed da [ ... ]
++    if (preg_match('/\[([^\]]+)\]/', $remaining, $matches)) {
++        $result['speed'] = trim($matches[1]);
++        $remaining = preg_replace('/\[[^\]]+\]/', '', $remaining);
++    }
++
++    // Estrai circuit da { ... }
++    if (preg_match('/\{([^}]+)\}/', $remaining, $matches)) {
++        $result['circuit'] = trim($matches[1]);
++        $remaining = preg_replace('/\{[^}]+\}/', '', $remaining);
++    }
++
++    // Estrai notes da ( ... )
++    if (preg_match('/\(([^)]+)\)/', $remaining, $matches)) {
++        $result['notes'] = trim($matches[1]);
++        $remaining = preg_replace('/\([^)]+\)/', '', $remaining);
++    }
++
++    // Il resto è la description
++    $result['descr'] = trim($remaining);
++
++    // Rimuovi campi vuoti
++    return array_filter($result, fn($v) => $v !== '');
++};
